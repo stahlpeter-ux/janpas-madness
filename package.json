@@ -1,0 +1,10 @@
+{
+  "name": "janpas-madness",
+  "version": "1.0.0",
+  "description": "Janpa's Madness - NCAA Sweet 16 Pool",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
