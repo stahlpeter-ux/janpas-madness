@@ -5,15 +5,14 @@ const path = require('path');
 
 const PORT = process.env.PORT || 3000;
 
-// Data file paths
-const DATA_DIR = path.join(__dirname, 'data');
-const ENTRIES_FILE = path.join(DATA_DIR, 'entries.json');
-const RESULTS_FILE = path.join(DATA_DIR, 'results.json');
+// JSONBlob.com cloud storage for persistence
+const ENTRIES_BLOB_ID = process.env.ENTRIES_BLOB_ID || '019d2c76-2fdf-76f9-bb11-165816e7cd37';
+const RESULTS_BLOB_ID = process.env.RESULTS_BLOB_ID || '019d2c76-4587-7d0c-a8e3-e2ace5bdeae7';
+const JSONBLOB_HOST = 'jsonblob.com';
 
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-if (!fs.existsSync(ENTRIES_FILE)) fs.writeFileSync(ENTRIES_FILE, '[]');
-if (!fs.existsSync(RESULTS_FILE)) fs.writeFileSync(RESULTS_FILE, JSON.stringify({ results: {}, finalScore: null, lastUpdated: null }));
+// In-memory cache (loaded from cloud on startup)
+let entriesCache = [];
+let resultsCache = { results: {}, finalScore: null, lastUpdated: null };
 
 // MIME types
 const MIME = {
@@ -79,12 +78,98 @@ function identifyGame(t1Info, t2Info, currentResults) {
 }
 
 // ============================================================
-// DATA ACCESS
+// CLOUD STORAGE (jsonblob.com)
 // ============================================================
-function readEntries() { try { return JSON.parse(fs.readFileSync(ENTRIES_FILE, 'utf8')); } catch { return []; } }
-function writeEntries(e) { fs.writeFileSync(ENTRIES_FILE, JSON.stringify(e, null, 2)); }
-function readResults() { try { return JSON.parse(fs.readFileSync(RESULTS_FILE, 'utf8')); } catch { return { results: {}, finalScore: null, lastUpdated: null }; } }
-function writeResults(d) { fs.writeFileSync(RESULTS_FILE, JSON.stringify(d, null, 2)); }
+function cloudRequest(method, blobId, data) {
+  return new Promise((resolve, reject) => {
+    const options = {
+      hostname: JSONBLOB_HOST,
+      path: `/api/jsonBlob/${blobId}`,
+      method: method,
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      }
+    };
+
+    const req = https.request(options, res => {
+      let body = '';
+      res.on('data', c => body += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(body)); }
+        catch { resolve(null); }
+      });
+    });
+
+    req.on('error', err => {
+      console.error(`Cloud storage error (${method} ${blobId}):`, err.message);
+      reject(err);
+    });
+
+    if (data !== undefined) req.write(JSON.stringify(data));
+    req.end();
+  });
+}
+
+async function loadEntriesFromCloud() {
+  try {
+    const data = await cloudRequest('GET', ENTRIES_BLOB_ID);
+    if (Array.isArray(data)) {
+      entriesCache = data;
+      console.log(`  Loaded ${entriesCache.length} entries from cloud`);
+    }
+  } catch (err) {
+    console.error('Failed to load entries from cloud:', err.message);
+  }
+}
+
+async function saveEntriesToCloud() {
+  try {
+    await cloudRequest('PUT', ENTRIES_BLOB_ID, entriesCache);
+    console.log(`  Saved ${entriesCache.length} entries to cloud`);
+  } catch (err) {
+    console.error('Failed to save entries to cloud:', err.message);
+  }
+}
+
+async function loadResultsFromCloud() {
+  try {
+    const data = await cloudRequest('GET', RESULTS_BLOB_ID);
+    if (data && typeof data === 'object') {
+      resultsCache = data;
+      const numResults = Object.keys(resultsCache.results || {}).length;
+      console.log(`  Loaded ${numResults} results from cloud`);
+    }
+  } catch (err) {
+    console.error('Failed to load results from cloud:', err.message);
+  }
+}
+
+async function saveResultsToCloud() {
+  try {
+    await cloudRequest('PUT', RESULTS_BLOB_ID, resultsCache);
+    console.log(`  Saved results to cloud`);
+  } catch (err) {
+    console.error('Failed to save results to cloud:', err.message);
+  }
+}
+
+// ============================================================
+// DATA ACCESS (in-memory with cloud sync)
+// ============================================================
+function readEntries() { return entriesCache; }
+
+async function writeEntries(e) {
+  entriesCache = e;
+  await saveEntriesToCloud();
+}
+
+function readResults() { return resultsCache; }
+
+async function writeResults(d) {
+  resultsCache = d;
+  await saveResultsToCloud();
+}
 
 // ============================================================
 // ESPN SCORE FETCHER
@@ -121,7 +206,6 @@ async function fetchESPNScores() {
       } catch {}
     }
 
-    const currentData = readResults();
     let updated = false;
 
     for (const event of allEvents) {
@@ -140,22 +224,22 @@ async function fetchESPNScores() {
       const t2Score = parseInt(c[1].score);
       const winnerInfo = t1Score > t2Score ? t1Info : t2Info;
 
-      const gameId = identifyGame(t1Info, t2Info, currentData.results);
-      if (!gameId || currentData.results[gameId]) continue;
+      const gameId = identifyGame(t1Info, t2Info, resultsCache.results);
+      if (!gameId || resultsCache.results[gameId]) continue;
 
       console.log(`  Result: ${winnerInfo.seedName} wins (${gameId})`);
-      currentData.results[gameId] = winnerInfo.seedName;
+      resultsCache.results[gameId] = winnerInfo.seedName;
       updated = true;
 
       if (gameId === 'champ') {
-        currentData.finalScore = { team1: Math.max(t1Score, t2Score), team2: Math.min(t1Score, t2Score) };
+        resultsCache.finalScore = { team1: Math.max(t1Score, t2Score), team2: Math.min(t1Score, t2Score) };
       }
     }
 
     if (updated) {
-      currentData.lastUpdated = new Date().toISOString();
-      writeResults(currentData);
-      console.log('  Results updated!');
+      resultsCache.lastUpdated = new Date().toISOString();
+      await saveResultsToCloud();
+      console.log('  Results updated and saved to cloud!');
     } else {
       console.log('  No new results');
     }
@@ -214,7 +298,7 @@ const server = http.createServer(async (req, res) => {
       submittedAt: new Date().toISOString()
     };
     entries.push(entry);
-    writeEntries(entries);
+    await writeEntries(entries);
     return sendJSON(res, 201, entry);
   }
 
@@ -224,7 +308,7 @@ const server = http.createServer(async (req, res) => {
     const before = entries.length;
     entries = entries.filter(e => e.id !== id);
     if (entries.length === before) return sendJSON(res, 404, { error: 'Not found' });
-    writeEntries(entries);
+    await writeEntries(entries);
     return sendJSON(res, 200, { success: true });
   }
 
@@ -234,22 +318,20 @@ const server = http.createServer(async (req, res) => {
 
   if (pathname === '/api/results' && method === 'POST') {
     const body = await readBody(req);
-    const data = readResults();
     if (body.gameId && body.winner) {
-      data.results[body.gameId] = body.winner;
-      data.lastUpdated = new Date().toISOString();
+      resultsCache.results[body.gameId] = body.winner;
+      resultsCache.lastUpdated = new Date().toISOString();
     }
-    writeResults(data);
-    return sendJSON(res, 200, data);
+    await writeResults(resultsCache);
+    return sendJSON(res, 200, resultsCache);
   }
 
   if (pathname === '/api/results/final-score' && method === 'POST') {
     const body = await readBody(req);
-    const data = readResults();
-    data.finalScore = { team1: parseInt(body.team1), team2: parseInt(body.team2) };
-    data.lastUpdated = new Date().toISOString();
-    writeResults(data);
-    return sendJSON(res, 200, data);
+    resultsCache.finalScore = { team1: parseInt(body.team1), team2: parseInt(body.team2) };
+    resultsCache.lastUpdated = new Date().toISOString();
+    await writeResults(resultsCache);
+    return sendJSON(res, 200, resultsCache);
   }
 
   if (pathname === '/api/refresh' && method === 'POST') {
@@ -272,13 +354,26 @@ const server = http.createServer(async (req, res) => {
   res.end('Not Found');
 });
 
-server.listen(PORT, () => {
-  console.log(`\n\uD83C\uDFC0 Janpa's Madness is running at http://localhost:${PORT}\n`);
-  console.log('Fetching initial scores from ESPN...');
-  fetchESPNScores();
-  // Poll ESPN every 2 minutes
-  setInterval(() => {
-    console.log(`[${new Date().toLocaleTimeString()}] Checking ESPN for updates...`);
+// ============================================================
+// STARTUP
+// ============================================================
+(async () => {
+  console.log('\nLoading data from cloud storage...');
+  await loadEntriesFromCloud();
+  await loadResultsFromCloud();
+
+  server.listen(PORT, () => {
+    console.log(`\n\uD83C\uDFC0 Janpa's Madness is running at http://localhost:${PORT}`);
+    console.log(`  Cloud storage: jsonblob.com`);
+    console.log(`  Entries blob: ${ENTRIES_BLOB_ID}`);
+    console.log(`  Results blob: ${RESULTS_BLOB_ID}\n`);
+    console.log('Fetching initial scores from ESPN...');
     fetchESPNScores();
-  }, 2 * 60 * 1000);
-});
+    // Poll ESPN every 2 minutes
+    setInterval(() => {
+      console.log(`[${new Date().toLocaleTimeString()}] Checking ESPN for updates...`);
+      fetchESPNScores();
+    }, 2 * 60 * 1000);
+  });
+})();
+
